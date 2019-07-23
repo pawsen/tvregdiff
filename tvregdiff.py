@@ -130,9 +130,9 @@ import sys
 
 try:
     import numpy as np
-    import scipy as sp
     from scipy import sparse
     from scipy.sparse import linalg as splin
+    from sksparse.cholmod import cholesky
 except ImportError:
     sys.exit("Numpy and Scipy must be installed for TVRegDiag to work - "
              "aborting")
@@ -241,7 +241,6 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
                 plt.show()
 
     elif (scale.lower() == 'large'):
-
         # Construct antidifferentiation operator and its adjoint.
         def A(v): return np.cumsum(v)
 
@@ -251,9 +250,15 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
         # Construct differentiation matrix.
         c = np.ones(n)
         D = sparse.spdiags([-c, c], [0, 1], n, n) / dx
-        mask = np.ones((n, n))
-        mask[-1, -1] = 0.0
-        D = sparse.dia_matrix(D.multiply(mask))
+        # Convert to lil() for changing elements and to csr for num operations
+        D = D.tolil(copy=False)
+        D[-1,-1] = 0
+        D = D.tocsr(copy=False)
+
+        # using mask matrix consumes too much memory for longer signals
+        #mask = np.ones((n, n),dtype=bool)
+        #mask[-1, -1] = 0
+        #D = sparse.dia_matrix(D.multiply(mask))
         DT = D.transpose()
         # Since Au( 0 ) = 0, we need to adjust.
         data = data - data[0]
@@ -277,7 +282,9 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
             c = np.cumsum(range(n, 0, -1))
             B = alph * L + sparse.spdiags(c[::-1], 0, n, n)
             # droptol = 1.0e-2
-            R = sparse.dia_matrix(np.linalg.cholesky(B.todense()))
+            # https://scikit-sparse.readthedocs.io/en/latest/cholmod.html#sksparse.cholmod.Factor
+            R = sparse.dia_matrix(cholesky(B).L())
+            # R = sparse.dia_matrix(np.linalg.cholesky(B.todense()))
             # Prepare to solve linear equation.
             tol = 1.0e-4
             maxit = 100
@@ -285,10 +292,10 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
             def linop(v): return (alph * L * v + AT(A(v)))
             linop = splin.LinearOperator((n, n), linop)
 
-            if diagflag:
-                [s, info_i] = sparse.linalg.cg(
+            [s, info_i] = sparse.linalg.cg(
                     linop, -g, x0=None, tol=tol, maxiter=maxit, callback=None,
                     M=np.dot(R.transpose(), R))
+            if diagflag:
                 print('iteration {0:4d}: relative change = {1:.3e}, '
                       'gradient norm = {2:.3e}\n'.format(ii,
                                                          np.linalg.norm(s[0]) /
@@ -298,17 +305,18 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
                     print("WARNING - convergence to tolerance not achieved!")
                 elif (info_i < 0):
                     print("WARNING - illegal input or breakdown")
+                else:
+                    print("Converged")
 
-            else:
-                [s, info_i] = sparse.linalg.cg(
-                    linop, -g, x0=None, tol=tol, maxiter=maxit, callback=None,
-                    M=np.dot(R.transpose(), R))
             # Update current solution
             u = u + s
             # Display plot.
             if plotflag:
                 plt.plot(u/dx)
                 plt.show()
+
+            if info_i == 0:
+                break  # we converged
 
         u = u/dx
 
@@ -319,21 +327,25 @@ def TVRegDiff(data, itern, alph, u0=None, scale='small', ep=1e-6, dx=None,
 
 if __name__ == "__main__":
 
-    dx = 0.05
+    fs = 1e2
+    dx = 1/fs
+    # dx = 0.05
     x0 = np.arange(0, 2.0*np.pi, dx)
 
     testf = np.sin(x0)
 
+    np.random.seed(10)
     testf = testf + np.random.normal(0.0, 0.04, x0.shape)
 
-    deriv_sm = TVRegDiff(testf, 1, 5e-2, dx=dx,
+    deriv_sm = TVRegDiff(testf, itern=1, alph=5e-2, dx=dx,
                          ep=1e-1, scale='small', plotflag=0)
-    deriv_lrg = TVRegDiff(testf, 100, 1e-1, dx=dx,
+    deriv_lrg = TVRegDiff(testf, itern=100, alph=1e-1, dx=dx,
                           ep=1e-2, scale='large', plotflag=0)
-
+    dfdx = np.cos(x0)
+    df_grad = np.gradient(testf, dx)
     if (_has_matplotlib):
-        plt.plot(np.cos(x0), label='Analytical', c=(0,0,0))
-        plt.plot(np.gradient(testf, dx), label='numpy.gradient')
+        plt.plot(dfdx, label='Analytical', c=(0,0,0))
+        #plt.plot(df_grad, label='numpy.gradient')
         plt.plot(deriv_sm, label='TVRegDiff (small)')
         plt.plot(deriv_lrg, label='TVRegDiff (large)')
         plt.legend()
